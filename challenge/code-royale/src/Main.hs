@@ -17,16 +17,28 @@
 -- You should have received a copy of the GNU General Public License
 -- along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ConstraintKinds       #-}
+{-# LANGUAGE ExplicitForAll        #-}
+{-# LANGUAGE FlexibleContexts      #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 module Main where
 
 import           Control.Monad              (replicateM, (>=>))
-import           Control.Monad.State.Strict
+import           Control.Monad.State.Strict (MonadIO, MonadState, evalStateT,
+                                             get, gets, liftIO, put)
+import           Data.List
 import           Data.Semigroup             ((<>))
 import           System.IO
 
-data Owner = Nobody | Friendly | Enemy
+type AppMonad m = (MonadIO m, MonadState GameInfo m)
+
+{-
+########################################
+########## Game Data
+########################################
+-}
+data Owner = Nobody | Friendly | Enemy deriving (Show, Eq)
 
 instance Enum Owner where
   fromEnum Nobody   = -1
@@ -48,9 +60,9 @@ type TrainingList = [SiteId]
 data Site = Site { sId     :: SiteId,
                    sPos    :: Position,
                    sRadius :: Radius
-                 }
+                 } deriving (Show, Eq)
 
-data StructureType = Empty | Barracks
+data StructureType = Empty | Barracks deriving (Show, Eq)
 
 instance Enum StructureType where
   fromEnum Empty    = -1
@@ -58,7 +70,7 @@ instance Enum StructureType where
   toEnum (-1) = Empty
   toEnum 2    = Barracks
 
-data UnitType = Queen | Knight | Archer
+data UnitType = Queen | Knight | Archer deriving (Show, Eq)
 
 instance Enum UnitType where
   fromEnum Queen  = -1
@@ -75,23 +87,23 @@ data SiteInfo = SiteInfo { iId        :: SiteId
                          , iOwner     :: Owner
                          , iCooldown  :: Cooldown
                          , iCreepType :: UnitType
-                         }
+                         } deriving (Show, Eq)
 
 
 data Unit = Unit { uPos    :: Position
                  , uOwner  :: Owner
                  , uType   :: UnitType
                  , uHealth :: Health
-                 }
+                 } deriving (Show, Eq)
 
 data GameInfo = GameInfo { gSites       :: [Site]
                          , gGolds       :: Gold
-                         , gTouchedSite :: TouchedSite
+                         , gTouchedSite :: Maybe Int
                          , gSiteInfos   :: [SiteInfo]
                          , gUnits       :: [Unit]
-                         }
+                         } deriving (Show, Eq)
 
-data Operation = Wait | Move Position | Build SiteId UnitType
+data Operation = Wait | Move Position | Build SiteId UnitType deriving (Eq)
 
 instance Show Operation where
   show Wait          = "WAIT"
@@ -99,6 +111,14 @@ instance Show Operation where
   show (Build i t)   = "BUILD " <> show i <> " BARRACKS-" <> show (fromEnum t)
 
 data Command = Command Operation TrainingList
+
+{-
+########################################
+########## Game Management
+########################################
+-}
+doNothing :: Command
+doNothing = Command Wait []
 
 closeChapter :: MonadIO m => Command -> m ()
 closeChapter (Command o l) =
@@ -128,8 +148,8 @@ main =  initializeOutput >> playBook
   where
     initializeOutput = hSetBuffering stdout NoBuffering
     playBook = prologue
-      >>= chapter
-      >>= evalStateT readBook
+               >>= chapter
+               >>= evalStateT readBook
 
 prologue :: MonadIO m => m [Site]
 prologue = loopParse parseSite
@@ -141,7 +161,11 @@ chapter :: MonadIO m => [Site] -> m GameInfo
 chapter s = parseWith parseGame
   where
     parseGame [g, t] =
-      pure (GameInfo s g t) <*> title (length s) <*> epic
+      let isInContact =
+            case t of
+              -1 -> Nothing
+              x  -> Just x
+      in pure (GameInfo s g isInContact) <*> title (length s) <*> epic
 
 title :: MonadIO m => Int -> m [SiteInfo]
 title = replicateParse parseSiteInfo
@@ -155,15 +179,49 @@ epic = loopParse parseUnit
     parseUnit [x, y, o, t, h] =
       pure $ Unit (x , y) (toEnum o) (toEnum t) h
 
-readBook :: (MonadIO m, MonadState GameInfo m) => m ()
-readBook = do
-  -- ####################
-  -- TODO: GAMEPLAY
-  -- ####################
-  closeChapter $ Command Wait []
-  continueReading
+readBook :: AppMonad m => m ()
+readBook = readingIsActuallyBoring
+           >>= closeChapter
+           >> continueReading
   where
     continueReading = gets gSites
-      >>= chapter
-      >>= put
-      >> readBook
+                      >>= chapter
+                      >>= put
+                      >> readBook
+
+{-
+########################################
+########## Game Strategy
+########################################
+-}
+
+getUnits :: AppMonad m => UnitType -> m [Unit]
+getUnits t = fmap desiredTypeOnly (gets gUnits)
+  where
+    desiredTypeOnly = filter ((==) t . uType)
+
+distance :: Position -> Position -> Int
+distance (xa, ya) (xb, yb) = x * x + y * y
+  where
+    x = xb - xa
+    y = yb - ya
+
+nearestSite :: AppMonad m => m SiteId
+nearestSite = do
+  sites <- gets gSites
+  pure 0
+
+readingIsActuallyBoring :: AppMonad m => m Command
+readingIsActuallyBoring = pure Command
+                          <*> (gets gTouchedSite >>= doLessBoringMove)
+                          <*> trainUselessSoldiers
+  where
+    doLessBoringMove (Just siteInContact) = do
+      pure Wait
+
+    doLessBoringMove Nothing = do
+      pure Wait
+
+    trainUselessSoldiers = do
+      pure []
+
