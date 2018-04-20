@@ -103,7 +103,7 @@ data Command = Command Operation TrainingList
 closeChapter :: MonadIO m => Command -> m ()
 closeChapter (Command o l) =
      liftIO (print o)
-  >> liftIO (print (foldr (\i s -> s <> " " <> show i) "TRAIN" l))
+  >> liftIO (putStrLn (foldr (\i s -> s <> " " <> show i) "TRAIN" l))
 
 applyTo :: a -> (a -> b) -> b
 applyTo = flip ($)
@@ -114,16 +114,19 @@ readInt = read
 parseWith ::  MonadIO m => ([Int] -> m b) -> m b
 parseWith f = f . fmap readInt . words =<< liftIO getLine
 
-loopParse :: MonadIO m => ([Int] -> m a) -> m [a]
-loopParse f = fmap (replicateM . readInt) (liftIO getLine) >>= applyTo (parseWith f)
+replicateParse :: MonadIO m => ([Int] -> m a) -> Int -> m [a]
+replicateParse f i = replicateM i (parseWith f)
 
-crossOut :: MonadIO m => String -> m ()
-crossOut = liftIO . hPutStrLn stderr
+loopParse :: MonadIO m => ([Int] -> m a) -> m [a]
+loopParse f = replicateParse f . readInt =<< liftIO getLine
+
+crossOut :: Show a => MonadIO m => a -> m ()
+crossOut = liftIO . hPrint stderr
 
 main :: IO ()
-main = hSetBuffering stdout NoBuffering >> playBook
+main =  initializeOutput >> playBook
   where
-    playBook :: IO ()
+    initializeOutput = hSetBuffering stdout NoBuffering
     playBook = prologue
       >>= chapter
       >>= evalStateT readBook
@@ -138,10 +141,10 @@ chapter :: MonadIO m => [Site] -> m GameInfo
 chapter s = parseWith parseGame
   where
     parseGame [g, t] =
-      pure (GameInfo s g t) <*> title <*> epic
+      pure (GameInfo s g t) <*> title (length s) <*> epic
 
-title :: MonadIO m => m [SiteInfo]
-title = loopParse parseSiteInfo
+title :: MonadIO m => Int -> m [SiteInfo]
+title = replicateParse parseSiteInfo
   where
     parseSiteInfo [id, a, b, t, o, c, ct] =
       pure $ SiteInfo id a b (toEnum t) (toEnum o) c (toEnum ct)
