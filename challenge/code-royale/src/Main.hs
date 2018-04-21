@@ -25,7 +25,7 @@
 module Main where
 
 import           Control.Applicative        (liftA2)
-import           Control.Monad              (join, replicateM, filterM)
+import           Control.Monad              (filterM, join, replicateM)
 import           Control.Monad.State.Strict (MonadIO, MonadState, evalStateT,
                                              get, gets, liftIO, put)
 import           Data.Char                  (toUpper)
@@ -53,6 +53,7 @@ instance Enum Owner where
 
 type SiteId       = Int
 type Position     = V2 Float
+type Direction    = Position
 type Radius       = Int
 type Gold         = Int
 type TouchedSite  = SiteId
@@ -293,7 +294,7 @@ maxIncomeByMine :: Int
 maxIncomeByMine = 5
 
 minViableNbOfMines :: Int
-minViableNbOfMines = 3
+minViableNbOfMines = 2
 
 minViableIncome :: Int
 minViableIncome = minViableNbOfMines * maxIncomeByMine
@@ -365,6 +366,15 @@ unitToProduce o = unitToCreate <$> mapM (fmap length . getUnits o) [Knight, Arch
       | giants  < 1 = Giant
       | otherwise   = Archer
 
+getEscapeDirection :: AppMonad m => m Direction
+getEscapeDirection = do
+  enemies <- gameFilter (pure . hostile . uOwner) gUnits
+  queen   <- getQueen Friendly
+  let enemiesDistance = zip enemies $ fmap ((|--| uPos queen) . uPos) enemies
+      enemiesNear = filter ((< 200) . vlength . snd) enemiesDistance
+  -- TODO: finalize that good escape
+  pure (V2 0 0)
+
 readingIsActuallyBoring :: AppMonad m => m Command
 readingIsActuallyBoring = do
   sites <- gets gSites
@@ -382,7 +392,7 @@ lessBoringOperation nbOfSites totalSite
       <*> getGiantBarracks Friendly
       <*> getArcherBarracks Friendly
 
-  | otherwise = escape
+  | otherwise = defend
 
 lessUselessSites :: AppMonad m => m TrainingList
 lessUselessSites = trainCreeps
@@ -417,7 +427,6 @@ conquer mines kBarracks gBarracks aBarracks
   | length kBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Knight)
   | length gBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Giant)
   | length mines < minViableNbOfMines = buildOnSite mineIsUpgradable buildMine
-  -- | length aBarracks < 1           = buildOnSite (buildBarracksOf Archer)
   | otherwise                         = do
       totalIncome <- getTotalIncome Friendly
       if totalIncome < minViableIncome
@@ -426,20 +435,21 @@ conquer mines kBarracks gBarracks aBarracks
   where
     ownerIsNobody = pure . nobody . iOwner . snd
 
-    mineIsUpgradable (_, i)
+    mineIsUpgradable (site, info)
       | not (isFriendly && not isGoldMine) && isNotProducingMaxIncome = do
-          -- TODO: don't try to build is enemies are near
-          pure True
+          -- TODO: don't try to build if enemies are near
+          queen <- getQueen Friendly
+          enemies <- gameFilter (pure . hostile . uOwner) gUnits
+          let nearestEnemies = filter ((< 200) . distance (uPos queen) . uPos) enemies
+          pure $ null nearestEnemies
 
       | otherwise = pure False
         where
-          isFriendly = friendly (iOwner i)
-          isGoldMine = iType i == GoldMine
-          isNotProducingMaxIncome = let income = iExtraParam1 i
-                                        maxIncome = iMaxGoldRate i
+          isFriendly = friendly (iOwner info)
+          isGoldMine = iType info == GoldMine
+          isNotProducingMaxIncome = let income = iExtraParam1 info
+                                        maxIncome = iMaxGoldRate info
                                     in income == -1 && maxIncome == -1 || income < maxIncome
-
-
 
 buildOnSite :: AppMonad m => (SiteWithInfo -> m Bool) -> (SiteId -> Operation) -> m Operation
 buildOnSite sigma pi = do
@@ -454,13 +464,15 @@ buildOnSite sigma pi = do
 
     Nothing        -> do
       debug "Cannot find anything to build on"
-      pure Wait
+      buildOnSite ownerIsNobody buildTower
 
-escape :: AppMonad m => m Operation
-escape = do
+  where
+    ownerIsNobody = pure . nobody . iOwner . snd
+
+defend :: AppMonad m => m Operation
+defend = do
   debug "Escaping"
   enemies <- gameFilter (pure . hostile . uOwner) gUnits
   queen   <- getQueen Friendly
   let nearestEnemies = filter ((< 200) . distance (uPos queen) . uPos) enemies
-  -- TODO: effectively escape
   pure Wait
