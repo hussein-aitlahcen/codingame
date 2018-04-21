@@ -27,7 +27,8 @@ module Main where
 import           Control.Monad              (replicateM, (>=>))
 import           Control.Monad.State.Strict (MonadIO, MonadState, evalStateT,
                                              get, gets, liftIO, put)
-import           Data.List
+import           Data.Char                  (toUpper)
+import           Data.List                  (filter, head, sortOn)
 import           Data.Semigroup             ((<>))
 import           System.IO
 
@@ -56,6 +57,8 @@ type TouchedSite  = SiteId
 type Cooldown     = Int
 type Health       = Int
 type TrainingList = [SiteId]
+type SiteWithInfo = (Site, SiteInfo)
+type Sites        = [SiteWithInfo]
 
 data Site = Site { sId     :: SiteId,
                    sPos    :: Position,
@@ -89,17 +92,15 @@ data SiteInfo = SiteInfo { iId        :: SiteId
                          , iCreepType :: UnitType
                          } deriving (Show, Eq)
 
-
 data Unit = Unit { uPos    :: Position
                  , uOwner  :: Owner
                  , uType   :: UnitType
                  , uHealth :: Health
                  } deriving (Show, Eq)
 
-data GameInfo = GameInfo { gSites       :: [Site]
+data GameInfo = GameInfo { gSites       :: [(Site, SiteInfo)]
                          , gGolds       :: Gold
                          , gTouchedSite :: Maybe Int
-                         , gSiteInfos   :: [SiteInfo]
                          , gUnits       :: [Unit]
                          } deriving (Show, Eq)
 
@@ -108,7 +109,7 @@ data Operation = Wait | Move Position | Build SiteId UnitType deriving (Eq)
 instance Show Operation where
   show Wait          = "WAIT"
   show (Move (x, y)) = "MOVE " <> show x <> " " <> show y
-  show (Build i t)   = "BUILD " <> show i <> " BARRACKS-" <> show (fromEnum t)
+  show (Build i t)   = "BUILD " <> show i <> " BARRACKS-" <> fmap toUpper (show t)
 
 data Command = Command Operation TrainingList
 
@@ -123,7 +124,7 @@ doNothing = Command Wait []
 closeChapter :: MonadIO m => Command -> m ()
 closeChapter (Command o l) =
      liftIO (print o)
-  >> liftIO (putStrLn (foldr (\i s -> s <> " " <> show i) "TRAIN" l))
+  *> liftIO (putStrLn (foldr (\i s -> s <> " " <> show i) "TRAIN" l))
 
 applyTo :: a -> (a -> b) -> b
 applyTo = flip ($)
@@ -140,11 +141,11 @@ replicateParse f i = replicateM i (parseWith f)
 loopParse :: MonadIO m => ([Int] -> m a) -> m [a]
 loopParse f = replicateParse f . readInt =<< liftIO getLine
 
-crossOut :: Show a => MonadIO m => a -> m ()
-crossOut = liftIO . hPrint stderr
+crossOut :: Show a => MonadIO m => m a -> m a
+crossOut ma = ma >>= \x -> liftIO (hPrint stderr x) *> pure x
 
 main :: IO ()
-main =  initializeOutput >> playBook
+main =  initializeOutput *> playBook
   where
     initializeOutput = hSetBuffering stdout NoBuffering
     playBook = prologue
@@ -165,7 +166,11 @@ chapter s = parseWith parseGame
             case t of
               -1 -> Nothing
               x  -> Just x
-      in pure (GameInfo s g isInContact) <*> title (length s) <*> epic
+      in pure GameInfo
+         <*> (zip s <$> title (length s))
+         <*> pure g
+         <*> pure isInContact
+         <*> epic
 
 title :: MonadIO m => Int -> m [SiteInfo]
 title = replicateParse parseSiteInfo
@@ -182,23 +187,34 @@ epic = loopParse parseUnit
 readBook :: AppMonad m => m ()
 readBook = readingIsActuallyBoring
            >>= closeChapter
-           >> continueReading
+           >>continueReading
   where
     continueReading = gets gSites
-                      >>= chapter
+                      >>= chapter . fmap fst
                       >>= put
                       >> readBook
 
 {-
 ########################################
-########## Game Strategy
+########    Game Strategy
 ########################################
+
+Sorry for the partial functions, hope that codingame is not broken :>
 -}
 
-getUnits :: AppMonad m => UnitType -> m [Unit]
-getUnits t = fmap desiredTypeOnly (gets gUnits)
-  where
-    desiredTypeOnly = filter ((==) t . uType)
+buildKnight :: SiteId -> Operation
+buildKnight x = Build x Knight
+
+buildArcher :: SiteId -> Operation
+buildArcher x = Build x Archer
+
+
+cost :: UnitType -> Int
+cost Knight = 80
+cost Archer = 100
+
+friendly :: Owner -> Bool
+friendly = (==) Friendly
 
 distance :: Position -> Position -> Int
 distance (xa, ya) (xb, yb) = x * x + y * y
@@ -206,22 +222,52 @@ distance (xa, ya) (xb, yb) = x * x + y * y
     x = xb - xa
     y = yb - ya
 
-nearestSite :: AppMonad m => m SiteId
-nearestSite = do
-  sites <- gets gSites
-  pure 0
+gameFilter :: AppMonad m => (a -> Bool) -> (GameInfo -> [a]) -> m [a]
+gameFilter sigma pi = fmap (filter sigma) (gets pi)
+
+getUnits :: AppMonad m => UnitType -> Owner -> m [Unit]
+getUnits t o = gameFilter desiredOnly gUnits
+  where
+    desiredOnly unit = uType unit == t && uOwner unit == o
+
+getQueen :: AppMonad m => Owner -> m Unit
+getQueen o = fmap head (getUnits Queen o)
+
+nearestSites :: AppMonad m => (SiteWithInfo -> Bool) -> Position -> m Sites
+nearestSites sigma from = fmap sortByDistance filteredSites
+  where
+    filteredSites = gameFilter sigma gSites
+    sortByDistance = sortOn (distance from . sPos . fst)
+
+nearestSite :: AppMonad m => (SiteWithInfo -> Bool) -> Position -> m SiteWithInfo
+nearestSite sigma from = fmap head (nearestSites sigma from)
 
 readingIsActuallyBoring :: AppMonad m => m Command
 readingIsActuallyBoring = pure Command
-                          <*> (gets gTouchedSite >>= doLessBoringMove)
-                          <*> trainUselessSoldiers
+                          <*> lessBoringOperation
+                          <*> lessUselessSites
+
+lessBoringOperation :: AppMonad m => m Operation
+lessBoringOperation = fmap (buildKnight . sId . fst) bestSiteToCapture
   where
-    doLessBoringMove (Just siteInContact) = do
-      pure Wait
+    bestSiteToCapture = getQueen Friendly
+                        >>= nearestSite (not . friendly . iOwner . snd) . uPos
 
-    doLessBoringMove Nothing = do
-      pure Wait
+lessUselessSites :: AppMonad m => m TrainingList
+lessUselessSites = fmap fst
+                   $ pure possibleProduction
+                   <*> gets gGolds
+                   <*> crossOut (fmap reverse friendlySitesNearTheQueen)
+  where
+    friendlySitesNearTheQueen = getQueen Enemy
+                                >>= nearestSites friendlyAndNotInCooldown . uPos
+    friendlyAndNotInCooldown (_, info) = friendly (iOwner info) && iCooldown info == 0
 
-    trainUselessSoldiers = do
-      pure []
-
+possibleProduction :: Gold -> Sites -> ([SiteId], Int)
+possibleProduction currentGolds = foldr step ([], currentGolds)
+  where
+    step (site, info) (xs, availableGolds)
+      | availableGolds - siteCost >= 0 = (sId site:xs, availableGolds - siteCost)
+      | otherwise = (xs, availableGolds)
+      where
+        siteCost = cost (iCreepType info)
