@@ -125,7 +125,7 @@ data Operation = Wait | Move Position | Build SiteId Construction deriving Eq
 
 instance Show Operation where
   show Wait                        = "WAIT"
-  show (Move (V2 x y))             = "MOVE "  <> show x <> " " <> show y
+  show (Move (V2 x y))             = "MOVE "  <> show (truncate x) <> " " <> show (truncate y)
   show (Build i (BuildBarracks t)) = "BUILD " <> show i <> " BARRACKS-" <> (toUpper <$> show t)
   show (Build i BuildTower)        = "BUILD " <> show i <> " TOWER"
   show (Build i BuildMine)         = "BUILD " <> show i <> " MINE"
@@ -150,11 +150,15 @@ instance Applicative V2 where
 (|--|) :: Floating a => V2 a -> V2 a -> V2 a
 (|--|) = liftA2 (-)
 
-(|//|) :: Floating a => V2 a -> V2 a -> V2 a
-(|//|) = liftA2 (/)
+(|//|) :: (Floating a, Eq a) => V2 a -> V2 a ->  Maybe (V2 a)
+(|//|) u (V2 0.0 0.0) = Nothing
+(|//|) u v = Just $ liftA2 (/) u v
 
 (|*|) :: Floating a => V2 a -> a -> V2 a
 (|*|) u c = fmap (* c) u
+
+vzero :: Floating a => V2 a
+vzero = V2 0 0
 
 vlength :: Floating a => V2 a -> a
 vlength (V2 x y) = sqrt(xx + yy)
@@ -299,6 +303,12 @@ minViableNbOfMines = 2
 minViableIncome :: Int
 minViableIncome = minViableNbOfMines * maxIncomeByMine
 
+minViableHealth :: Int
+minViableHealth = 5
+
+maxQueenMovement :: Float
+maxQueenMovement = 60.0
+
 friendly :: Owner -> Bool
 friendly = (==) Friendly
 
@@ -372,18 +382,25 @@ getEscapeDirection = do
   queen   <- getQueen Friendly
   let enemiesDistance = zip enemies $ fmap ((|--| uPos queen) . uPos) enemies
       enemiesNear = filter ((< 200) . vlength . snd) enemiesDistance
-  -- TODO: finalize that good escape
-  pure (V2 0 0)
+      escapeDirection = oppositeDirection enemiesNear
+  pure $ escapeDirection |*| (-1)
+  where
+    oppositeDirection = foldr step vzero
+      where
+        step (_, v) acc = acc |++| normalize v
 
 readingIsActuallyBoring :: AppMonad m => m Command
 readingIsActuallyBoring = do
   sites <- gets gSites
+  health <- uHealth <$> getQueen Friendly
   pure Command
-    <*> lessBoringOperation (length . filter (friendly . iOwner . snd) $ sites) (length sites)
+    <*> lessBoringOperation (length . filter (friendly . iOwner . snd) $ sites) (length sites) health
     <*> lessUselessSites
 
-lessBoringOperation :: AppMonad m => Int -> Int -> m Operation
-lessBoringOperation nbOfSites totalSite
+lessBoringOperation :: AppMonad m => Int -> Int -> Int -> m Operation
+lessBoringOperation nbOfSites totalSite health
+
+  | health < minViableHealth = survive
 
   | nbOfSites < totalSite  // 2 =
       join $ pure conquer
@@ -392,7 +409,7 @@ lessBoringOperation nbOfSites totalSite
       <*> getGiantBarracks Friendly
       <*> getArcherBarracks Friendly
 
-  | otherwise = defend
+  | otherwise = survive
 
 lessUselessSites :: AppMonad m => m TrainingList
 lessUselessSites = trainCreeps
@@ -425,23 +442,24 @@ possibleProduction currentGolds = foldr step ([], currentGolds)
 conquer :: AppMonad m => Sites -> Sites -> Sites -> Sites -> m Operation
 conquer mines kBarracks gBarracks aBarracks
   | length kBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Knight)
-  | length gBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Giant)
+  -- TODO: giants/archers ???
   | length mines < minViableNbOfMines = buildOnSite mineIsUpgradable buildMine
   | otherwise                         = do
       totalIncome <- getTotalIncome Friendly
       if totalIncome < minViableIncome
         then buildOnSite mineIsUpgradable buildMine
-        else buildOnSite ownerIsNobody buildTower
+        else buildOnSite towerIsUpgradable buildTower
   where
-    ownerIsNobody = pure . nobody . iOwner . snd
+
+    ownerIsNobody (site, info) = pure $ nobody owner
+      where
+        owner = iOwner info
 
     mineIsUpgradable (site, info)
       | not (isFriendly && not isGoldMine) && isNotProducingMaxIncome = do
-          -- TODO: don't try to build if enemies are near
           queen <- getQueen Friendly
           enemies <- gameFilter (pure . hostile . uOwner) gUnits
-          let nearestEnemies = filter ((< 200) . distance (uPos queen) . uPos) enemies
-          pure $ null nearestEnemies
+          pure $ not $ any ((< 400) . distance (uPos queen) . uPos) enemies
 
       | otherwise = pure False
         where
@@ -453,26 +471,35 @@ conquer mines kBarracks gBarracks aBarracks
 
 buildOnSite :: AppMonad m => (SiteWithInfo -> m Bool) -> (SiteId -> Operation) -> m Operation
 buildOnSite sigma pi = do
-  debug "FindEmptySite"
+  debug "BuildOnSite"
   queen <- getQueen Friendly
   s <- nearestSite sigma (uPos queen)
   case s of
     Just (site, _) -> do
-      -- TODO: run toward the target
-      -- and try to avoid any contact with the enemies
-      pure (pi (sId site))
+      isInContact <- gets gTouchedSite
+      case isInContact of
+        (Just siteId) | siteId == sId site -> pure (pi (sId site))
+        _ -> do
+          escapeDirection <- getEscapeDirection
+          let directionToTarget = normalize (sPos site |--| uPos queen)
+              finalDirection = normalize escapeDirection |++| (directionToTarget |*| maxQueenMovement)
+          debug escapeDirection
+          debug directionToTarget
+          pure (Move $ uPos queen |++| finalDirection)
 
-    Nothing        -> do
-      debug "Cannot find anything to build on"
-      buildOnSite ownerIsNobody buildTower
+    Nothing        ->
+      buildOnSite towerIsUpgradable buildTower
 
+towerIsUpgradable :: AppMonad m => SiteWithInfo -> m Bool
+towerIsUpgradable (site, info) = pure $ nobody owner || (isTower && friendly owner && towerLife <= 400)
   where
-    ownerIsNobody = pure . nobody . iOwner . snd
+    owner     = iOwner info
+    towerLife = iExtraParam1 info
+    isTower   = iType info == Tower
 
-defend :: AppMonad m => m Operation
-defend = do
-  debug "Escaping"
-  enemies <- gameFilter (pure . hostile . uOwner) gUnits
-  queen   <- getQueen Friendly
-  let nearestEnemies = filter ((< 200) . distance (uPos queen) . uPos) enemies
-  pure Wait
+survive :: AppMonad m => m Operation
+survive = do
+  debug "Survive"
+  queen <- getQueen Friendly
+  escapeDirection <- getEscapeDirection
+  pure $ Move (uPos queen |++| (escapeDirection |*| maxQueenMovement))
