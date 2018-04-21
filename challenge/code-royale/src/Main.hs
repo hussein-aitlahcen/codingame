@@ -24,13 +24,14 @@
 
 module Main where
 
-import           Control.Monad              (replicateM, (>=>))
+import           Control.Monad              (replicateM)
 import           Control.Monad.State.Strict (MonadIO, MonadState, evalStateT,
                                              get, gets, liftIO, put)
 import           Data.Char                  (toUpper)
 import           Data.List                  (filter, head, sortOn)
 import           Data.Semigroup             ((<>))
-import           System.IO
+import           System.IO                  (BufferMode (..), hPrint,
+                                             hSetBuffering, stderr, stdout)
 
 type AppMonad m = (MonadIO m, MonadState GameInfo m)
 
