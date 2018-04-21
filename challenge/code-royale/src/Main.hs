@@ -66,31 +66,39 @@ data Site = Site { sId     :: SiteId,
                    sRadius :: Radius
                  } deriving (Show, Eq)
 
-data StructureType = Empty | Barracks deriving (Show, Eq)
+data StructureType = Empty | Tower | Barracks deriving (Show, Eq)
 
 instance Enum StructureType where
   fromEnum Empty    = -1
+  fromEnum Tower    = 1
   fromEnum Barracks = 2
   toEnum (-1) = Empty
+  toEnum 1    = Tower
   toEnum 2    = Barracks
 
-data UnitType = Queen | Knight | Archer deriving (Show, Eq)
+data UnitType = Queen | Knight | Archer | Giant deriving (Show, Eq)
 
 instance Enum UnitType where
   fromEnum Queen  = -1
   fromEnum Knight = 0
   fromEnum Archer = 1
+  fromEnum Giant  = 2
   toEnum (-1) = Queen
   toEnum 0    = Knight
   toEnum 1    = Archer
+  toEnum 2    = Giant
 
-data SiteInfo = SiteInfo { iId        :: SiteId
-                         , iIgnore1   :: Int
-                         , iIgnore2   :: Int
-                         , iType      :: StructureType
-                         , iOwner     :: Owner
-                         , iCooldown  :: Cooldown
-                         , iCreepType :: UnitType
+data SiteInfo = SiteInfo { iId          :: SiteId
+                         , iIgnore1     :: Int
+                         , iIgnore2     :: Int
+                         , iType        :: StructureType
+                         , iOwner       :: Owner
+                         -- tower: HP
+                         -- barracks: Cooldown
+                         , iExtraParam1 :: Cooldown
+                         -- tower: Attack Radius
+                         -- barracks: CreepType
+                         , iExtraParam2 :: UnitType
                          } deriving (Show, Eq)
 
 data Unit = Unit { uPos    :: Position
@@ -105,12 +113,15 @@ data GameInfo = GameInfo { gSites       :: [(Site, SiteInfo)]
                          , gUnits       :: [Unit]
                          } deriving (Show, Eq)
 
-data Operation = Wait | Move Position | Build SiteId UnitType deriving (Eq)
+data Construction = BuildTower | BuildBarracks UnitType deriving Eq
+
+data Operation = Wait | Move Position | Build SiteId Construction deriving Eq
 
 instance Show Operation where
   show Wait          = "WAIT"
   show (Move (x, y)) = "MOVE " <> show x <> " " <> show y
-  show (Build i t)   = "BUILD " <> show i <> " BARRACKS-" <> fmap toUpper (show t)
+  show (Build i (BuildBarracks t))   = "BUILD " <> show i <> " BARRACKS-" <> fmap toUpper (show t)
+  show (Build i BuildTower)   = "BUILD " <> show i <> " TOWER"
 
 data Command = Command Operation TrainingList
 
@@ -204,15 +215,16 @@ Sorry for the partial functions, hope that codingame is not broken :>
 -}
 
 buildKnight :: SiteId -> Operation
-buildKnight x = Build x Knight
+buildKnight x = Build x (BuildBarracks Knight)
 
 buildArcher :: SiteId -> Operation
-buildArcher x = Build x Archer
+buildArcher x = Build x (BuildBarracks Archer)
 
 
 cost :: UnitType -> Int
-cost Knight = 80
-cost Archer = 100
+cost Knight = 80 -- group of 4
+cost Archer = 100 -- group of 2
+cost Giant  = 140 -- one
 
 friendly :: Owner -> Bool
 friendly = (==) Friendly
@@ -255,14 +267,14 @@ lessBoringOperation = fmap (buildKnight . sId . fst) bestSiteToCapture
                         >>= nearestSite (not . friendly . iOwner . snd) . uPos
 
 lessUselessSites :: AppMonad m => m TrainingList
-lessUselessSites = fmap fst
-                   $ pure possibleProduction
+lessUselessSites = fmap fst $
+                   pure possibleProduction
                    <*> gets gGolds
                    <*> crossOut (fmap reverse friendlySitesNearTheQueen)
   where
     friendlySitesNearTheQueen = getQueen Enemy
                                 >>= nearestSites friendlyAndNotInCooldown . uPos
-    friendlyAndNotInCooldown (_, info) = friendly (iOwner info) && iCooldown info == 0
+    friendlyAndNotInCooldown (_, info) = friendly (iOwner info) && iExtraParam1 info == 0
 
 possibleProduction :: Gold -> Sites -> ([SiteId], Int)
 possibleProduction currentGolds = foldr step ([], currentGolds)
@@ -271,4 +283,4 @@ possibleProduction currentGolds = foldr step ([], currentGolds)
       | availableGolds - siteCost >= 0 = (sId site:xs, availableGolds - siteCost)
       | otherwise = (xs, availableGolds)
       where
-        siteCost = cost (iCreepType info)
+        siteCost = cost (iExtraParam2 info)
