@@ -336,10 +336,13 @@ maxQueenMovement :: Float
 maxQueenMovement = 60.0
 
 minViableHealthForTower :: Int
-minViableHealthForTower = 500
+minViableHealthForTower = 700
 
 minEnemyDistanceToMine :: Float
-minEnemyDistanceToMine = 450.0
+minEnemyDistanceToMine = 450
+
+minEnemyDistanceToSurvive :: Float
+minEnemyDistanceToSurvive = 350
 
 friendly :: Owner -> Bool
 friendly = (==) Friendly
@@ -410,7 +413,7 @@ unitToProduce o = unitToCreate <$> mapM (fmap length . getUnits o) [Knight, Arch
       | otherwise   = Knight
 
 getTowersDirection :: Position -> Sites -> Direction
-getTowersDirection from = vsum . fmap ((from |--|) . sPos . fst)
+getTowersDirection from = vsumWeightByLength . fmap ((|--| from) . sPos . fst)
 
 getEscapeWall :: Position -> Direction
 getEscapeWall (V2 x y) = let walls = [V2 0 1   |/| y,
@@ -419,15 +422,15 @@ getEscapeWall (V2 x y) = let walls = [V2 0 1   |/| y,
                                      V2 (-1) 0 |/| (fromIntegral mapWidth -  x)]
                         in vsum walls
 
-getEscapeDirection :: AppMonad m => Position -> m Direction
-getEscapeDirection from = do
-  enemies <- gameFilter (pure . hostile . uOwner) gUnits
-  towers <- getTowers Friendly
-  let enemiesDistance = zip enemies $ (|--| from) . uPos <$> enemies
-      escapeDirection = vsumWeightByLength (snd <$> enemiesDistance) |*| (-1) |*| fromIntegral (length enemies)
-      escapeWall = getEscapeWall from |*| fromIntegral (length enemies)
-      hideBetweenTurrets = getTowersDirection from towers |*| fromIntegral (length towers)
-  pure $ normalize $ escapeDirection |++| escapeWall |++| hideBetweenTurrets
+getEscapeDirection :: [Unit] -> Sites -> Sites -> Position -> Direction
+getEscapeDirection enemies enemyTowers friendlyTowers from =
+  let nbOfEnemies = fromIntegral (length enemies)
+      enemiesDistance = (from |--|) . uPos <$> enemies
+      enemyTowersDistance = (from |--|) . sPos . fst <$> enemyTowers
+      escapeDirection = vsumWeightByLength (enemiesDistance <> enemyTowersDistance) |*| nbOfEnemies
+      escapeWall = getEscapeWall from |*| nbOfEnemies
+      hideBetweenTurrets = getTowersDirection from friendlyTowers |*| nbOfEnemies
+    in normalize $ escapeDirection |++| escapeWall |++| hideBetweenTurrets
 
 readingIsActuallyBoring :: AppMonad m => m Command
 readingIsActuallyBoring = do
@@ -442,12 +445,7 @@ lessBoringOperation nbOfSites totalSite health
 
   | health < minViableHealth = survive
 
-  | otherwise =
-      join $ pure conquer
-      <*> getMines Friendly
-      <*> getKnightBarracks Friendly
-      <*> getGiantBarracks Friendly
-      <*> getArcherBarracks Friendly
+  | otherwise = conquer
 
 lessUselessSites :: AppMonad m => m TrainingList
 lessUselessSites = trainCreeps
@@ -477,29 +475,31 @@ possibleProduction currentGolds = foldr step ([], currentGolds)
       where
         siteCost = cost (iExtraParam2 info)
 
-conquer :: AppMonad m => Sites -> Sites -> Sites -> Sites -> m Operation
-conquer mines kBarracks gBarracks aBarracks
-  | length kBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Knight)
-  -- | length gBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Giant)
-  -- TODO: giants/archers ???
-  | length mines < minViableNbOfMines = buildOnSite mineIsUpgradable buildMine
-  | otherwise                         = do
-      totalIncome <- getTotalIncome Friendly
-      if totalIncome < minViableIncome
-        then buildOnSite mineIsUpgradable buildMine
-        else buildOnSite towerIsUpgradable buildTower
+conquer :: AppMonad m => m Operation
+conquer = do
+  mines <- getMines Friendly
+  kBarracks <- getKnightBarracks Friendly
+  gBarracks <- getGiantBarracks Friendly
+  aBarracks <- getArcherBarracks Friendly
+  doConquer mines kBarracks gBarracks aBarracks
   where
-
-    ownerIsNobody (site, info) = pure $ nobody owner
-      where
-        owner = iOwner info
-
+    doConquer mines kBarracks gBarracks aBarracks
+      | length kBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Knight)
+      -- | length gBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Giant)
+      -- TODO: giants/archers ???
+      | length mines < minViableNbOfMines = buildOnSite mineIsUpgradable buildMine
+      | otherwise                         = do
+          totalIncome <- getTotalIncome Friendly
+          if totalIncome < minViableIncome
+            then buildOnSite mineIsUpgradable buildMine
+            else buildOnSite towerIsUpgradable buildTower
+            where
+              ownerIsNobody (site, info) = pure $ nobody (iOwner info)
     mineIsUpgradable (site, info)
       | not (isFriendly && not isGoldMine) && isNotProducingMaxIncome = do
           queen <- getQueen Friendly
           enemies <- gameFilter (pure . hostile . uOwner) gUnits
           pure $ not $ any ((< minEnemyDistanceToMine) . distance (uPos queen) . uPos) enemies
-
       | otherwise = pure False
         where
           isFriendly = friendly (iOwner info)
@@ -519,11 +519,12 @@ buildOnSite sigma pi = do
       case isInContact of
         (Just siteId) | siteId == sId site -> pure (pi (sId site))
         _ -> do
-          escapeDirection <- getEscapeDirection (uPos queen)
-          let directionToTarget = normalize (sPos site |--| uPos queen)
-              finalDirection = normalize escapeDirection |++| (directionToTarget |*| maxQueenMovement)
-          debug escapeDirection
-          debug directionToTarget
+          enemies <- gameFilter (pure . hostile . uOwner) gUnits
+          enemyTowers <- getTowers Enemy
+          friendlyTowers <- getTowers Friendly
+          let escapeDirection = getEscapeDirection enemies enemyTowers friendlyTowers (uPos queen)
+              directionToTarget = normalize (sPos site |--| uPos queen)
+              finalDirection = normalize escapeDirection |++| (directionToTarget |*| (maxQueenMovement * 4))
           pure $ Move $ uPos queen |++| finalDirection
 
     Nothing        ->
@@ -540,7 +541,15 @@ survive :: AppMonad m => m Operation
 survive = do
   debug "Survive"
   queen <- getQueen Friendly
-  escapeDirection <- getEscapeDirection (uPos queen)
-  let targetDirection = escapeDirection |*| maxQueenMovement
-      targetPosition = uPos queen |++| targetDirection
-  pure $ Move targetPosition
+  enemies <- gameFilter (pure . hostile . uOwner) gUnits
+  let enemyNear = any ((< minEnemyDistanceToSurvive) . distance (uPos queen) . uPos) enemies
+  if enemyNear
+    then do debug "Escape"
+            enemyTowers <- getTowers Enemy
+            friendlyTowers <- getTowers Friendly
+            let escapeDirection = getEscapeDirection enemies enemyTowers friendlyTowers (uPos queen)
+                targetDirection = escapeDirection |*| maxQueenMovement
+                targetPosition  = uPos queen |++| targetDirection
+            pure $ Move targetPosition
+    else do debug "Defend"
+            conquer
