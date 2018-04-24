@@ -30,7 +30,7 @@ import           Control.Monad.State.Strict (MonadIO, MonadState, evalStateT,
                                              get, gets, liftIO, put)
 import           Data.Char                  (toUpper)
 import           Data.List                  (filter, head, sortOn)
-import           Data.Semigroup             ((<>))
+import           Data.Semigroup             (Semigroup (..))
 import           System.IO                  (BufferMode (..), hPrint,
                                              hSetBuffering, stderr, stdout)
 
@@ -80,17 +80,19 @@ instance Enum StructureType where
   toEnum 1    = Tower
   toEnum 2    = Barracks
 
-data UnitType = Queen | Knight | Archer | Giant deriving (Show, Eq)
+data UnitType = Queen | Knight | Archer | Giant | ExtraParam Int deriving (Show, Eq)
 
 instance Enum UnitType where
-  fromEnum Queen  = -1
-  fromEnum Knight = 0
-  fromEnum Archer = 1
-  fromEnum Giant  = 2
+  fromEnum Queen          = -1
+  fromEnum Knight         = 0
+  fromEnum Archer         = 1
+  fromEnum Giant          = 2
+  fromEnum (ExtraParam x) = x
   toEnum (-1) = Queen
   toEnum 0    = Knight
   toEnum 1    = Archer
   toEnum 2    = Giant
+  toEnum x    = ExtraParam x
 
 data SiteInfo = SiteInfo { iId             :: SiteId
                          , iAvailableGolds :: Int
@@ -134,12 +136,34 @@ data Command = Command Operation TrainingList
 
 data V2 a = V2 a a deriving (Eq, Show)
 
+instance Semigroup Float where
+  (<>) = (+)
+
+instance Monoid Float where
+  mempty = 0
+  mappend = (<>)
+
 instance Functor V2 where
   fmap f (V2 x y) = V2 (f x) (f y)
 
 instance Applicative V2 where
   pure x = V2 x x
   (V2 f g) <*> (V2 x y) = V2 (f x) (g y)
+
+instance Num a => Num (V2 a) where
+  negate      = fmap negate
+  (+)         = liftA2 (+)
+  (*)         = liftA2 (*)
+  fromInteger = pure . fromInteger
+  abs         = fmap abs
+  signum      = fmap signum
+
+instance Semigroup a => Semigroup (V2 a) where
+  (<>) = liftA2 (<>)
+
+instance (Semigroup a, Monoid a) => Monoid (V2 a) where
+  mempty = V2 mempty mempty
+  mappend = (<>)
 
 (|**|) :: Floating a => V2 a -> V2 a -> V2 a
 (|**|) = liftA2 (*)
@@ -152,17 +176,14 @@ instance Applicative V2 where
 
 (|//|) :: (Floating a, Eq a) => V2 a -> V2 a -> V2 a
 (|//|) u (V2 0.0 0.0) = u
-(|//|) u v = liftA2 (/) u v
+(|//|) u v            = liftA2 (/) u v
 
 (|*|) :: Floating a => V2 a -> a -> V2 a
 (|*|) u c = (* c) <$> u
 
 (|/|) :: (Floating a, Eq a) => V2 a -> a -> V2 a
 (|/|) u 0.0 = u
-(|/|) u c = (/ c) <$> u
-
-vzero :: Floating a => V2 a
-vzero = V2 0 0
+(|/|) u c   = (/ c) <$> u
 
 vlength :: Floating a => V2 a -> a
 vlength (V2 x y) = sqrt(xx + yy)
@@ -171,10 +192,10 @@ vlength (V2 x y) = sqrt(xx + yy)
     yy = y * y
 
 vsum :: (Floating a, Eq a, Foldable f) => f (V2 a) -> V2 a
-vsum = normalize . foldr (|++|) vzero
+vsum = normalize . sum
 
-vsumWeightByLength :: (Floating a, Eq a, Foldable f) => f (V2 a) -> V2 a
-vsumWeightByLength = normalize . foldr step vzero
+vsumWeightByLength :: (Semigroup a, Monoid a, Floating a, Eq a, Foldable f) => f (V2 a) -> V2 a
+vsumWeightByLength = normalize . foldr step mempty
   where
     step v acc = let normalized = normalize v
                      distanceModifier = 1.0 / (vlength v + 1)
@@ -187,7 +208,7 @@ normalize v@(V2 x y) = V2 (x / l) (y / l)
     l = vlength v
 
 distance :: Floating a => V2 a -> V2 a -> a
-distance u v = vlength (v |--| u)
+distance u v = vlength (u |--| v)
 
 mkV2 :: Int -> Int -> V2 Float
 mkV2 x y = V2 (fromIntegral x) (fromIntegral y)
@@ -320,14 +341,20 @@ mapHalfWidth = mapWidth // 2
 mapHalfHeight :: Int
 mapHalfHeight = mapHeight // 2
 
+minAvailableGoldToMine :: Int
+minAvailableGoldToMine = 15
+
 maxIncomeByMine :: Int
-maxIncomeByMine = 5
+maxIncomeByMine = 4
 
 minViableNbOfMines :: Int
-minViableNbOfMines = 2
+minViableNbOfMines = 3
 
 minViableIncome :: Int
-minViableIncome = minViableNbOfMines * maxIncomeByMine
+minViableIncome = 5
+
+maxViableIncome :: Int
+maxViableIncome = maxIncomeByMine * minViableNbOfMines
 
 minViableHealth :: Int
 minViableHealth = 10
@@ -355,6 +382,9 @@ hostile = (==) Enemy
 
 gameFilter :: AppMonad m => (a -> m Bool) -> (GameInfo -> [a]) -> m [a]
 gameFilter sigma pi = filterM sigma =<< gets pi
+
+getEnemies :: AppMonad m => m [Unit]
+getEnemies = gameFilter (pure . hostile . uOwner) gUnits
 
 getUnits :: AppMonad m => Owner -> UnitType -> m [Unit]
 getUnits o t = gameFilter ofOwnerAndTypeOnly gUnits
@@ -403,6 +433,17 @@ nearestSites sigma from = sortByDistance <$> filteredSites
 nearestSite :: AppMonad m => (SiteWithInfo -> m Bool) -> Position -> m (Maybe SiteWithInfo)
 nearestSite sigma from = safeHead <$> nearestSites sigma from
 
+bestSite :: AppMonad m => (SiteWithInfo -> m Bool) -> Position -> m (Maybe SiteWithInfo)
+bestSite sigma from = do
+  enemies <- getEnemies
+  sites   <- gameFilter sigma gSites
+  let scoreSelectors = [distance from . sPos . fst,
+                        sqrt . (\pos -> foldMap (distance pos . uPos) enemies) . sPos . fst]
+      sortedSites = sortWith scoreSelectors sites
+  pure $ safeHead sortedSites
+  where
+    sortWith selectors = sortOn (\s -> foldMap ($ s) selectors)
+
 unitToProduce :: AppMonad m => Owner -> m UnitType
 unitToProduce o = unitToCreate <$> mapM (fmap length . getUnits o) [Knight, Archer, Giant]
   where
@@ -413,7 +454,7 @@ unitToProduce o = unitToCreate <$> mapM (fmap length . getUnits o) [Knight, Arch
       | otherwise   = Knight
 
 getTowersDirection :: Position -> Sites -> Direction
-getTowersDirection from = vsumWeightByLength . fmap ((|--| from) . sPos . fst)
+getTowersDirection from = vsum . fmap ((|--| from) . sPos . fst)
 
 getEscapeWall :: Position -> Direction
 getEscapeWall (V2 x y) = let walls = [V2 0 1   |/| y,
@@ -426,11 +467,28 @@ getEscapeDirection :: [Unit] -> Sites -> Sites -> Position -> Direction
 getEscapeDirection enemies enemyTowers friendlyTowers from =
   let nbOfEnemies = fromIntegral (length enemies)
       enemiesDistance = (from |--|) . uPos <$> enemies
-      enemyTowersDistance = (from |--|) . sPos . fst <$> enemyTowers
-      escapeDirection = vsumWeightByLength (enemiesDistance <> enemyTowersDistance) |*| nbOfEnemies
-      escapeWall = getEscapeWall from |*| nbOfEnemies
-      hideBetweenTurrets = getTowersDirection from friendlyTowers |*| nbOfEnemies
-    in normalize $ escapeDirection |++| escapeWall |++| hideBetweenTurrets
+      escapeEnemiesMelee = vsumWeightByLength enemiesDistance |*| 2
+      escapeEnemiesTowers = normalize $ foldMap (enemyTowersEscape from) enemyTowers |*| 2
+      escapeWall = getEscapeWall from
+      hideBetweenTurrets = getTowersDirection from friendlyTowers
+    in normalize $ escapeEnemiesMelee  |++|
+                   escapeEnemiesTowers |++|
+                   escapeWall          |++|
+                   hideBetweenTurrets
+  where
+    enemyTowersEscape :: Position -> SiteWithInfo -> Direction
+    enemyTowersEscape from tower@(s, i)
+      | isInTowerRange from tower = towerDirection
+      | otherwise                 = mempty
+      where
+        towerPosition = sPos s
+        towerDirection = towerPosition |--| from
+
+isInTowerRange :: Position -> SiteWithInfo -> Bool
+isInTowerRange from (s, i) = let towerPosition = sPos s
+                                 towerRange = fromIntegral $ fromEnum $ iExtraParam2 i
+                                 distanceToTower = distance from towerPosition
+                             in towerRange >= distanceToTower
 
 readingIsActuallyBoring :: AppMonad m => m Command
 readingIsActuallyBoring = do
@@ -442,10 +500,8 @@ readingIsActuallyBoring = do
 
 lessBoringOperation :: AppMonad m => Int -> Int -> Int -> m Operation
 lessBoringOperation nbOfSites totalSite health
-
   | health < minViableHealth = survive
-
-  | otherwise = conquer
+  | otherwise                = conquer
 
 lessUselessSites :: AppMonad m => m TrainingList
 lessUselessSites = trainCreeps
@@ -477,58 +533,71 @@ possibleProduction currentGolds = foldr step ([], currentGolds)
 
 conquer :: AppMonad m => m Operation
 conquer = do
-  mines <- getMines Friendly
-  kBarracks <- getKnightBarracks Friendly
-  gBarracks <- getGiantBarracks Friendly
-  aBarracks <- getArcherBarracks Friendly
-  doConquer mines kBarracks gBarracks aBarracks
+  mines       <- getMines Friendly
+  totalIncome <- getTotalIncome Friendly
+  kb          <- getKnightBarracks Friendly
+  gb          <- getGiantBarracks Friendly
+  ab          <- getArcherBarracks Friendly
+  nbOfEnemies <- length <$> getUnits Enemy Knight
+  conquerStrategy mines totalIncome nbOfEnemies kb gb ab
   where
-    doConquer mines kBarracks gBarracks aBarracks
-      | length kBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Knight)
-      -- | length gBarracks < 1              = buildOnSite ownerIsNobody (buildBarracksOf Giant)
+    conquerStrategy mines income nbOfEnemies kb gb ab
+      | income < minViableIncome          = constructMine
+      | length kb < 1                     = constructBarracks Knight
       -- TODO: giants/archers ???
-      | length mines < minViableNbOfMines = buildOnSite mineIsUpgradable buildMine
-      | otherwise                         = do
-          totalIncome <- getTotalIncome Friendly
-          if totalIncome < minViableIncome
-            then buildOnSite mineIsUpgradable buildMine
-            else buildOnSite towerIsUpgradable buildTower
-            where
-              ownerIsNobody (site, info) = pure $ nobody (iOwner info)
+      | nbOfEnemies > 6                   = constructTower
+      | length mines < minViableNbOfMines = constructMine
+      | income < maxIncomeByMine          = constructMine
+      | otherwise                         = constructTower
+
+constructTower :: AppMonad m => m Operation
+constructTower = buildOnSite towerIsUpgradable buildTower
+
+constructMine :: AppMonad m => m Operation
+constructMine = buildOnSite mineIsUpgradable buildMine
+  where
     mineIsUpgradable (site, info)
-      | not (isFriendly && not isGoldMine) && isNotProducingMaxIncome = do
-          queen <- getQueen Friendly
+      | not (isFriendly && not isGoldMine) && isNotProducingMaxIncome && goldAvailable = do
+          queen   <- getQueen Friendly
           enemies <- gameFilter (pure . hostile . uOwner) gUnits
           pure $ not $ any ((< minEnemyDistanceToMine) . distance (uPos queen) . uPos) enemies
       | otherwise = pure False
         where
-          isFriendly = friendly (iOwner info)
-          isGoldMine = iType info == GoldMine
+          isFriendly    = friendly (iOwner info)
+          isGoldMine    = iType info == GoldMine
+          goldAvailable = iAvailableGolds info > 10
           isNotProducingMaxIncome = let income = iExtraParam1 info
                                         maxIncome = iMaxGoldRate info
                                     in income == -1 && maxIncome == -1 || income < maxIncome
+
+constructBarracks :: AppMonad m => UnitType -> m Operation
+constructBarracks unitType = buildOnSite ownerIsNobody (buildBarracksOf unitType)
+  where
+    ownerIsNobody (site, info) = let owner = iOwner info
+                                 in pure $ nobody owner
 
 buildOnSite :: AppMonad m => (SiteWithInfo -> m Bool) -> (SiteId -> Operation) -> m Operation
 buildOnSite sigma pi = do
   debug "BuildOnSite"
   queen <- getQueen Friendly
-  s <- nearestSite sigma (uPos queen)
+  s     <- bestSite sigma (uPos queen)
   case s of
     Just (site, _) -> do
       isInContact <- gets gTouchedSite
       case isInContact of
+        -- already in contact with the target
         (Just siteId) | siteId == sId site -> pure (pi (sId site))
         _ -> do
-          enemies <- gameFilter (pure . hostile . uOwner) gUnits
-          enemyTowers <- getTowers Enemy
+          enemies        <- gameFilter (pure . hostile . uOwner) gUnits
+          enemyTowers    <- getTowers Enemy
           friendlyTowers <- getTowers Friendly
           let escapeDirection = getEscapeDirection enemies enemyTowers friendlyTowers (uPos queen)
               directionToTarget = normalize (sPos site |--| uPos queen)
-              finalDirection = normalize escapeDirection |++| (directionToTarget |*| (maxQueenMovement * 4))
+              finalDirection = escapeDirection |++| (directionToTarget |*| maxQueenMovement)
           pure $ Move $ uPos queen |++| finalDirection
 
     Nothing        ->
-      buildOnSite towerIsUpgradable buildTower
+      constructTower
 
 towerIsUpgradable :: AppMonad m => SiteWithInfo -> m Bool
 towerIsUpgradable (site, info) = pure $ nobody owner || (isTower && friendly owner && towerLife <= minViableHealthForTower)
@@ -540,16 +609,18 @@ towerIsUpgradable (site, info) = pure $ nobody owner || (isTower && friendly own
 survive :: AppMonad m => m Operation
 survive = do
   debug "Survive"
-  queen <- getQueen Friendly
-  enemies <- gameFilter (pure . hostile . uOwner) gUnits
-  let enemyNear = any ((< minEnemyDistanceToSurvive) . distance (uPos queen) . uPos) enemies
-  if enemyNear
+  queen       <- getQueen Friendly
+  enemies     <- gameFilter (pure . hostile . uOwner) gUnits
+  enemyTowers <- getTowers Enemy
+  let queenPos       = uPos queen
+      enemyNear      = any ((< minEnemyDistanceToSurvive) . distance queenPos . uPos) enemies
+      enemyTowerNear = any (isInTowerRange queenPos) enemyTowers
+  if enemyNear || enemyTowerNear
     then do debug "Escape"
-            enemyTowers <- getTowers Enemy
             friendlyTowers <- getTowers Friendly
             let escapeDirection = getEscapeDirection enemies enemyTowers friendlyTowers (uPos queen)
                 targetDirection = escapeDirection |*| maxQueenMovement
                 targetPosition  = uPos queen |++| targetDirection
             pure $ Move targetPosition
     else do debug "Defend"
-            conquer
+            constructTower
