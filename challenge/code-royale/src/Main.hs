@@ -547,7 +547,7 @@ conquer = do
       -- TODO: giants/archers ???
       | nbOfEnemies > 6                   = constructTower
       | length mines < minViableNbOfMines = constructMine
-      | income < maxIncomeByMine          = constructMine
+      | income < maxViableIncome          = constructMine
       | otherwise                         = constructTower
 
 constructTower :: AppMonad m => m Operation
@@ -610,6 +610,7 @@ survive :: AppMonad m => m Operation
 survive = do
   debug "Survive"
   queen       <- getQueen Friendly
+  enemyQueen  <- getQueen Enemy
   enemies     <- gameFilter (pure . hostile . uOwner) gUnits
   enemyTowers <- getTowers Enemy
   let queenPos       = uPos queen
@@ -623,4 +624,8 @@ survive = do
                 targetPosition  = uPos queen |++| targetDirection
             pure $ Move targetPosition
     else do debug "Defend"
-            constructTower
+            income <- getTotalIncome Friendly
+            enemyIncome <- getTotalIncome Enemy
+            if uHealth enemyQueen > uHealth queen ||(income < minViableIncome && income < enemyIncome)
+              then constructMine
+              else constructTower
